@@ -19,6 +19,7 @@ from copy import copy
 from operator import itemgetter
 
 from .exceptions import (
+    DuplicateHeadersError,
     HeadersNeeded,
     InvalidDatasetIndex,
     InvalidDatasetType,
@@ -33,6 +34,58 @@ __author__ = 'Kenneth Reitz'
 __license__ = 'MIT'
 __copyright__ = 'Copyright 2017 Kenneth Reitz. 2019 Jazzband.'
 __docformat__ = 'restructuredtext'
+
+
+def _find_duplicate_headers(headers):
+    """Return the header values that appear more than once, in order of
+    first repetition. Works for any header type (including unhashable or
+    non-string values).
+
+    ``None`` headers are exempt: they denote empty header cells (common in
+    spreadsheet imports) and can never be used for column-name addressing,
+    so they cannot cause name collisions. Empty strings and other non-None
+    values *are* reported, since they are valid (if unusual) lookup keys.
+    """
+    seen = []
+    duplicates = []
+    for header in headers:
+        if header is None:
+            continue
+        if header in seen:
+            if header not in duplicates:
+                duplicates.append(header)
+        else:
+            seen.append(header)
+    return duplicates
+
+
+def _dedupe_header(header, existing, position):
+    """Build a unique variant of `header` against the `existing` names by
+    suffixing it with its 1-based column `position`. If the suffixed name
+    still collides, an extra counter is appended until it is unique."""
+    base = str(header) if header else 'column'
+    candidate = f'{base}_{position}'
+    counter = 2
+    while candidate in existing:
+        candidate = f'{base}_{position}_{counter}'
+        counter += 1
+    return candidate
+
+
+def _dedupe_headers(headers):
+    """Rename repeated headers by suffixing them with their 1-based column
+    position (e.g. ``['a', 'b', 'a']`` becomes ``['a', 'b', 'a_3']``).
+
+    The first occurrence of each header is kept untouched; empty or None
+    headers are renamed from the base name ``column``."""
+    seen = []
+    result = []
+    for position, header in enumerate(headers, start=1):
+        if header in seen:
+            header = _dedupe_header(header, seen, position)
+        result.append(header)
+        seen.append(header)
+    return result
 
 
 class Row:
@@ -144,6 +197,9 @@ class Dataset:
     :param \\*args: (optional) list of rows to populate Dataset
     :param headers: (optional) list strings for Dataset header row
     :param title: (optional) string to use as title of the Dataset
+    :param deduplicate_headers: (optional) when True, repeated header names
+        are silently renamed with their column position (e.g. ``a_3``)
+        instead of raising :class:`DuplicateHeadersError`
 
 
     .. admonition:: Format Attributes Definition
@@ -166,6 +222,9 @@ class Dataset:
 
         # {col_index: col_func}
         self._dynamic_columns = {}
+
+        # Rename repeated headers by column position instead of raising.
+        self._deduplicate_headers = kwargs.get('deduplicate_headers', False)
 
         self.headers = kwargs.get('headers')
 
@@ -251,6 +310,8 @@ class Dataset:
 
     def _set_in_format(self, fmt_key, in_stream, **kwargs):
         in_stream = normalize_input(in_stream)
+        if kwargs.pop('deduplicate_headers', False):
+            self._deduplicate_headers = True
         return registry.get_format(fmt_key).import_set(self, in_stream, **kwargs)
 
     def _validate(self, row=None, col=None, safety=False):
@@ -317,7 +378,15 @@ class Dataset:
         """Validating headers setter."""
         self._validate(collection)
         if collection:
-            self.__headers = list(collection)
+            headers = list(collection)
+            # getattr: objects restored from older pickles may lack the flag.
+            if getattr(self, '_deduplicate_headers', False):
+                headers = _dedupe_headers(headers)
+            else:
+                duplicates = _find_duplicate_headers(headers)
+                if duplicates:
+                    raise DuplicateHeadersError(duplicates)
+            self.__headers = headers
         else:
             self.__headers = None
 
@@ -416,6 +485,9 @@ class Dataset:
         `in_stream` can be a file-like object, a string, or a bytestring.
 
         :param \\*\\*kwargs: (optional) custom configuration to the format `import_set`.
+            The `deduplicate_headers` boolean is handled by the Dataset itself:
+            when True, duplicate imported headers are renamed by column
+            position instead of raising :class:`DuplicateHeadersError`.
         """
 
         stream = normalize_input(in_stream)
@@ -425,6 +497,9 @@ class Dataset:
         fmt = registry.get_format(format)
         if not hasattr(fmt, 'import_set'):
             raise UnsupportedFormat(f'Format {format} cannot be imported.')
+
+        if kwargs.pop('deduplicate_headers', False):
+            self._deduplicate_headers = True
 
         fmt.import_set(self, stream, **kwargs)
         return self
@@ -565,6 +640,15 @@ class Dataset:
             elif header and self.height == 0 and len(col):
                 raise InvalidDimensions
 
+            if header in self.headers:
+                # getattr: objects restored from older pickles may lack
+                # the flag.
+                if not getattr(self, '_deduplicate_headers', False):
+                    raise DuplicateHeadersError([header])
+                # Rename the new header using its 1-based position after
+                # insertion so that headers stay unique.
+                header = _dedupe_header(header, self.headers, index + 1)
+
             self.headers.insert(index, header)
 
         if self.height and self.width:
@@ -701,7 +785,12 @@ class Dataset:
         # it is our "hinge" on which we rotate the data
         new_headers = [self.headers[0]] + self[self.headers[0]]
 
-        _dset.headers = new_headers
+        # Transposed headers are derived from data values, which may
+        # legitimately contain duplicates. Assign them directly so that
+        # transpose() stays a pure rotation that round-trips; header
+        # uniqueness is enforced on import, construction and column
+        # operations, not on derived views.
+        _dset.__headers = new_headers
         for index, column in enumerate(self.headers):
 
             if column == self.headers[0]:
@@ -786,6 +875,11 @@ class Dataset:
             new_headers = self.headers + other.headers
         except TypeError:
             new_headers = None
+
+        if new_headers:
+            # Joining two header sets can yield duplicates; rename them by
+            # column position so the stacked dataset keeps unique headers.
+            new_headers = _dedupe_headers(new_headers)
 
         _dset = Dataset()
 

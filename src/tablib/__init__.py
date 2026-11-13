@@ -13,6 +13,7 @@ except ImportError:
 from .core import (  # noqa: F401
     Databook,
     Dataset,
+    DuplicateHeadersError,
     InvalidDatasetType,
     InvalidDimensions,
     UnsupportedFormat,

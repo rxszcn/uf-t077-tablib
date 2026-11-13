@@ -757,6 +757,163 @@ class TablibTestCase(BaseTestCase):
         self.assertTrue(john.has_tag(["tag2", "tag1"]))
 
 
+class DuplicateHeadersTests(BaseTestCase):
+    """Header uniqueness is enforced consistently on the construction,
+    import and column-operation paths, with an opt-in automatic
+    deduplication switch for lenient scenarios."""
+
+    # ---- Construction path ----
+
+    def test_constructor_rejects_duplicate_headers(self):
+        with self.assertRaises(tablib.DuplicateHeadersError) as ctx:
+            tablib.Dataset(headers=('first_name', 'last_name', 'first_name'))
+        self.assertEqual(ctx.exception.duplicates, ['first_name'])
+        self.assertIn("'first_name'", str(ctx.exception))
+
+    def test_headers_setter_rejects_duplicates(self):
+        with self.assertRaises(tablib.DuplicateHeadersError):
+            data.headers = ['a', 'b', 'a']
+        # The failed assignment leaves the dataset untouched.
+        self.assertIsNone(data.headers)
+
+    def test_duplicate_headers_error_is_structured(self):
+        try:
+            tablib.Dataset(headers=('x', 'y', 'x', 'y', 'x'))
+        except tablib.DuplicateHeadersError as exc:
+            self.assertIsInstance(exc, ValueError)
+            self.assertEqual(exc.duplicates, ['x', 'y'])
+        else:
+            self.fail('DuplicateHeadersError not raised')
+
+    def test_empty_string_headers_are_checked(self):
+        with self.assertRaises(tablib.DuplicateHeadersError):
+            tablib.Dataset(headers=('a', '', ''))
+
+    def test_none_headers_are_exempt(self):
+        # None denotes an empty header cell (common in spreadsheets) and
+        # cannot be used for column-name addressing, so repeats are allowed.
+        dataset = tablib.Dataset(headers=('a', None, None))
+        self.assertEqual(dataset.headers, ['a', None, None])
+
+    def test_non_string_headers_are_checked(self):
+        with self.assertRaises(tablib.DuplicateHeadersError) as ctx:
+            tablib.Dataset(headers=(1, 2, 1))
+        self.assertEqual(ctx.exception.duplicates, [1])
+
+    def test_constructor_deduplicate_headers_switch(self):
+        dataset = tablib.Dataset(
+            headers=('a', 'b', 'a', 'a'), deduplicate_headers=True
+        )
+        self.assertEqual(dataset.headers, ['a', 'b', 'a_3', 'a_4'])
+
+    def test_deduplicate_headers_renames_empty_and_none(self):
+        dataset = tablib.Dataset(
+            headers=('a', '', None, '', None), deduplicate_headers=True
+        )
+        self.assertEqual(dataset.headers, ['a', '', None, 'column_4', 'column_5'])
+
+    def test_deduplicate_headers_non_string(self):
+        dataset = tablib.Dataset(headers=(1, 1), deduplicate_headers=True)
+        self.assertEqual(dataset.headers, [1, '1_2'])
+
+    def test_deduplicate_headers_avoids_existing_names(self):
+        # The position-based candidate may itself collide with an existing
+        # header; an extra counter suffix is appended until it is unique.
+        dataset = tablib.Dataset(
+            headers=('a_3', 'a', 'a', 'a'), deduplicate_headers=True
+        )
+        self.assertEqual(dataset.headers, ['a_3', 'a', 'a_3_2', 'a_4'])
+
+    # ---- Import path ----
+
+    def test_import_rejects_duplicate_headers(self):
+        with self.assertRaises(tablib.DuplicateHeadersError) as ctx:
+            tablib.import_set('a,b,a\n1,2,3\n', format='csv')
+        self.assertEqual(ctx.exception.duplicates, ['a'])
+
+    def test_import_deduplicate_headers_switch(self):
+        dataset = tablib.import_set(
+            'a,b,a\n1,2,3\n', format='csv', deduplicate_headers=True
+        )
+        self.assertEqual(dataset.headers, ['a', 'b', 'a_3'])
+
+    def test_load_deduplicate_headers_switch(self):
+        dataset = tablib.Dataset().load(
+            'a,a\n1,2\n', format='csv', deduplicate_headers=True
+        )
+        self.assertEqual(dataset.headers, ['a', 'a_2'])
+
+    def test_column_addressing_after_deduplication(self):
+        # Once headers are unique, addressing columns by name works again
+        # and no column is silently dropped on dict/JSON export.
+        dataset = tablib.import_set(
+            'a,b,a\n1,2,3\n', format='csv', deduplicate_headers=True
+        )
+        self.assertEqual(dataset['a'], ['1'])
+        self.assertEqual(dataset['a_3'], ['3'])
+        self.assertEqual(
+            json.loads(dataset.json), [{'a': '1', 'b': '2', 'a_3': '3'}]
+        )
+
+    def test_import_ragged_rows_error_unchanged(self):
+        # Row/column length mismatches keep their existing error form.
+        data.headers = ['a', 'b']
+        with self.assertRaises(tablib.InvalidDimensions):
+            data.append((1, 2, 3))
+
+    # ---- Column operation path ----
+
+    def test_append_col_rejects_duplicate_header(self):
+        with self.assertRaises(tablib.DuplicateHeadersError) as ctx:
+            self.founders.append_col((1, 2, 3), header='gpa')
+        self.assertEqual(ctx.exception.duplicates, ['gpa'])
+        # The failed operation leaves the dataset untouched.
+        self.assertEqual(self.founders.headers,
+                         ['first_name', 'last_name', 'gpa'])
+        self.assertEqual(self.founders.width, 3)
+
+    def test_insert_col_rejects_duplicate_header(self):
+        with self.assertRaises(tablib.DuplicateHeadersError):
+            self.founders.insert_col(0, (1, 2, 3), header='first_name')
+
+    def test_lpush_col_rejects_duplicate_header(self):
+        with self.assertRaises(tablib.DuplicateHeadersError):
+            self.founders.lpush_col((1, 2, 3), header='last_name')
+
+    def test_append_col_deduplicates_with_switch(self):
+        dataset = tablib.Dataset(headers=['a', 'b'], deduplicate_headers=True)
+        dataset.append((1, 2))
+        dataset.append((3, 4))
+        dataset.append_col((5, 6), header='a')
+        self.assertEqual(dataset.headers, ['a', 'b', 'a_3'])
+        self.assertEqual(dataset['a_3'], [5, 6])
+
+    def test_insert_col_deduplicates_by_final_position(self):
+        dataset = tablib.Dataset(headers=['a', 'b'], deduplicate_headers=True)
+        dataset.append((1, 2))
+        dataset.append((3, 4))
+        dataset.insert_col(1, (5, 6), header='a')
+        self.assertEqual(dataset.headers, ['a', 'a_2', 'b'])
+        self.assertEqual(dataset['a_2'], [5, 6])
+
+    # ---- Export output is unchanged for unique headers ----
+
+    def test_export_unchanged_with_unique_headers(self):
+        self.assertEqual(
+            self.founders.json,
+            '[{"first_name": "John", "last_name": "Adams", "gpa": 90}, '
+            '{"first_name": "George", "last_name": "Washington", "gpa": 67}, '
+            '{"first_name": "Thomas", "last_name": "Jefferson", "gpa": 50}]'
+        )
+        self.assertEqual(
+            self.founders.csv,
+            'first_name,last_name,gpa\r\n'
+            'John,Adams,90\r\n'
+            'George,Washington,67\r\n'
+            'Thomas,Jefferson,50\r\n'
+        )
+
+
 class HTMLTests(BaseTestCase):
     founders_html = (
         "<table>"
